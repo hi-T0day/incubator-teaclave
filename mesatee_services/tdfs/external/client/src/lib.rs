@@ -24,3 +24,4 @@ extern crate sgx_tstd as std;
 mod file_util;
 mod tdfs_client;
 pub use tdfs_client::TDFSClient;
+pub use file_util::*;

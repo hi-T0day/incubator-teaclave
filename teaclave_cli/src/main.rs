@@ -25,10 +25,12 @@ use std::{net, path};
 use fns_proto::{InvokeTaskRequest, InvokeTaskResponse};
 use mesatee_core::config::{OutboundDesc, TargetDesc};
 use mesatee_core::rpc::channel;
-use tdfs_external_proto::{DFSRequest, DFSResponse};
+use mesatee_core;
+use tdfs_external_proto::{DFSRequest, DFSResponse, CreateFileResponse};
 use teaclave_utils;
 use teaclave_utils::EnclaveMeasurement;
 use tms_external_proto::{TaskRequest, TaskResponse};
+use tdfs_external_client::{get_local_access_path, encrypt_data, cal_hash};
 
 type EnclaveInfo = std::collections::HashMap<String, EnclaveMeasurement>;
 type CliResult = Result<(), ExitFailure>;
@@ -39,6 +41,7 @@ enum Endpoint {
     TDFS,
     FNS,
 }
+
 
 impl std::str::FromStr for Endpoint {
     type Err = String;
@@ -92,6 +95,22 @@ struct ConnectOpt {
 }
 
 #[derive(Debug, StructOpt)]
+struct FileOpt {
+    #[structopt(name = "UPLOAD_FILE_NAME", parse(from_os_str), required = true)]
+    /// File's name to be deal
+    file_name: path::PathBuf,
+    #[structopt(short, long, name = "METHOD", required = true)]
+    /// Method to file: encrypt, decrypt, meta 
+    method: String,
+    #[structopt(short, long, default_value = "")]
+    /// AES key config
+    key_config: String,
+    #[structopt(short = "o", long, name = "INPUT_FILE", parse(from_os_str))]
+    /// Write to FILE instead of stdout.
+    output: Option<path::PathBuf>,
+}
+
+#[derive(Debug, StructOpt)]
 enum Command {
     /// Audit enclave info with auditors' public keys and signatures.
     #[structopt(name = "audit")]
@@ -99,6 +118,9 @@ enum Command {
     /// Connect and send messages to Teaclave services
     #[structopt(name = "connect")]
     Connect(ConnectOpt),
+    /// File tools, help to SHA256/Encrypt/Decrypt file 
+    #[structopt(name = "file")]
+    File(FileOpt),
 }
 
 #[derive(Debug, StructOpt)]
@@ -106,6 +128,43 @@ enum Command {
 struct Cli {
     #[structopt(subcommand)]
     command: Command,
+}
+
+fn file(args: FileOpt) -> Result<(), failure::Error> {
+    let writer: Box<dyn Write> = match args.output {
+        Some(o) => Box::new(io::BufWriter::new(fs::File::create(o)?)),
+        None => Box::new(io::stdout()),
+    };
+
+    let data = fs::read(&args.file_name)
+        .map_err(|_| failure::err_msg("Error reading file"))?;
+    match &args.method[..]{
+        "meta" => {
+            let sha256 = cal_hash(&data)?;
+            let file_size = data.len() as u32;
+            let metainfo = serde_json::json!({
+                "sha256": sha256,
+                "size": file_size
+            });
+            serde_json::to_writer(writer, &metainfo)?;
+            Ok(())
+        },
+        "encrypt" => {
+            let resp:CreateFileResponse = serde_json::from_str(&args.key_config)?;
+            let access_path = get_local_access_path(&resp.access_path);
+            let key_config = resp.key_config;
+            let encrypted_data =
+                encrypt_data(data, &key_config.key, &key_config.nonce, &key_config.ad)?;
+            fs::write(&access_path, &encrypted_data)
+                .map_err(|_| failure::err_msg("Error writing file"))?;
+            println!("Encrypt file {:?} in {:?} successfully", &args.file_name, &access_path); 
+            Ok(())
+        }
+        _ => {
+            Result::Err(failure::err_msg("Wrong method to file, Use meta, encrypt, decrypt"))
+
+        }
+    }
 }
 
 macro_rules! generate_runner_for {
@@ -141,7 +200,7 @@ generate_runner_for!(fns, InvokeTaskRequest, InvokeTaskResponse);
 fn connect(args: ConnectOpt) -> Result<(), failure::Error> {
     let enclave_info_content = fs::read_to_string(&args.enclave_info)?;
     let enclave_info = teaclave_utils::load_enclave_info(&enclave_info_content);
-
+ 
     let reader: Box<dyn Read> = match args.input {
         Some(i) => Box::new(io::BufReader::new(fs::File::open(i)?)),
         None => Box::new(io::stdin()),
@@ -184,5 +243,6 @@ fn main() -> CliResult {
     match args.command {
         Command::Audit(audit_args) => Ok(audit(audit_args)?),
         Command::Connect(connect_args) => Ok(connect(connect_args)?),
+        Command::File(file_args) => Ok(file(file_args)?),
     }
 }
